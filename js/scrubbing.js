@@ -2,50 +2,73 @@ class ScrubVideo {
   constructor(section) {
     this.section = section;
     this.canvas = section.querySelector('canvas');
-    this.ctx = this.canvas.getContext('2d');
-    this.figcaption = section.querySelector('figcaption'); // select the figcaption
-
+    this.ctx = this.canvas.getContext('2d'); // alpha ON — no black box
+    this.figcaption = section.querySelector('figcaption');
     this.folder = section.dataset.folder;
     this.totalImages = parseInt(section.dataset.frames, 10);
-
-    this.images = [];
+    this.images = new Array(this.totalImages);
     this.currentFrameIndex = 0;
-    this.loadedImages = 0;
+    this.loadedCount = 0;
+    this.isReady = false;
+    this.pendingRender = false;
+    this.rafId = null;
+    this.lastFrameIndex = -1;
+    this._resizeTimer = null;
 
-    this.maxOpacity = 1; // maximum opacity for figcaption
-
+    this.resizeCanvas();
     this.loadImages();
     this.addResizeListener();
   }
 
   loadImages() {
-    for (let i = 1; i <= this.totalImages; i++) {
+    let firstFrameReady = false;
+
+    for (let i = 0; i < this.totalImages; i++) {
       const img = new Image();
-      img.src = `${this.folder}${i}.png`;
+      img.decoding = 'async';
+
       img.onload = () => {
-        this.loadedImages++;
-        if (this.loadedImages === this.totalImages) {
+        this.images[i] = img;
+        this.loadedCount++;
+
+        // Show first frame as soon as it arrives
+        if (i === 0 && !firstFrameReady) {
+          firstFrameReady = true;
+          this.isReady = true;
           this.addScrollListener();
-          this.render();
+          this.scheduleRender();
         }
       };
-      this.images.push(img);
+
+      img.onerror = () => { this.loadedCount++; };
+      img.src = `${this.folder}${i + 1}.png`;
     }
   }
 
   addScrollListener() {
-    window.addEventListener('scroll', () => this.onScroll());
+    window.addEventListener('scroll', () => this.onScroll(), { passive: true });
   }
 
   addResizeListener() {
-    window.addEventListener('resize', () => this.resizeCanvas());
-    this.resizeCanvas();
+    if (window.ResizeObserver) {
+      this._ro = new ResizeObserver(() => {
+        clearTimeout(this._resizeTimer);
+        this._resizeTimer = setTimeout(() => this.resizeCanvas(), 100);
+      });
+      this._ro.observe(this.section);
+    } else {
+      window.addEventListener('resize', () => {
+        clearTimeout(this._resizeTimer);
+        this._resizeTimer = setTimeout(() => this.resizeCanvas(), 100);
+      });
+    }
   }
 
   resizeCanvas() {
     this.canvas.width = window.innerWidth;
     this.canvas.height = window.innerHeight;
-    this.render();
+    this.lastFrameIndex = -1; // force re-render after resize
+    this.scheduleRender();
   }
 
   onScroll() {
@@ -56,23 +79,52 @@ class ScrubVideo {
       1
     );
 
-    const frameIndex = Math.floor(scrollProgress * (this.totalImages - 1));
+    const frameIndex = Math.min(
+      Math.floor(scrollProgress * this.totalImages),
+      this.totalImages - 1
+    );
+
     this.currentFrameIndex = frameIndex;
 
     const brightness = Math.min(100, scrollProgress * 80);
-    this.canvas.style.filter = `brightness(${brightness}%)`;
+    const opacity = Math.min(1, scrollProgress);
 
+    this.canvas.style.filter = `brightness(${brightness.toFixed(1)}%)`;
     if (this.figcaption) {
-      this.figcaption.style.opacity = Math.min(this.maxOpacity, scrollProgress * 1);
+      this.figcaption.style.opacity = opacity.toFixed(3);
     }
 
-    this.render();
+    // Only re-render if the frame changed
+    if (frameIndex !== this.lastFrameIndex) {
+      this.scheduleRender();
+    }
+  }
+
+  scheduleRender() {
+    if (this.pendingRender) return;
+    this.pendingRender = true;
+    this.rafId = requestAnimationFrame(() => {
+      this.pendingRender = false;
+      this.render();
+    });
   }
 
   render() {
-    if (!this.images[this.currentFrameIndex]) return;
+    const img = this.images[this.currentFrameIndex];
+    if (!img || !this.isReady) return;
+
+    // Skip if this frame is already displayed
+    if (this.currentFrameIndex === this.lastFrameIndex) return;
+    this.lastFrameIndex = this.currentFrameIndex;
+
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.drawImage(this.images[this.currentFrameIndex], 0, 0, this.canvas.width, this.canvas.height);
+    this.ctx.drawImage(img, 0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  destroy() {
+    if (this._ro) this._ro.disconnect();
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    clearTimeout(this._resizeTimer);
   }
 }
 
@@ -81,4 +133,3 @@ window.addEventListener('load', () => {
     new ScrubVideo(section);
   });
 });
-

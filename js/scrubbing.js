@@ -11,6 +11,7 @@ class ScrubVideo {
     // State
     this.currentFrameIndex = 0;
     this.lastFrameIndex = -1;
+    this.lastDrawnFrame = -1; // Tracks the actual image drawn for fallback logic
     this.pendingRender = false;
     this.isInView = false;
 
@@ -44,8 +45,8 @@ class ScrubVideo {
     // 2. Load the first frame immediately so the user sees something
     this.loadSingleImage(0).then(() => {
       this.scheduleRender();
-      // 3. Load the rest sequentially to avoid freezing the network stack
-      this.loadRemainingImagesSequentially();
+      // 3. Load the rest in batches to avoid network freezing and long sequential waits
+      this.loadRemainingImagesBatched();
     });
 
     // 4. Listeners
@@ -53,10 +54,20 @@ class ScrubVideo {
     window.addEventListener('resize', () => this.debouncedResize(), { passive: true });
   }
 
-  // Prevents the browser from choking on 100+ simultaneous image requests
-  async loadRemainingImagesSequentially() {
-    for (let i = 1; i < this.totalImages; i++) {
-      await this.loadSingleImage(i);
+  // Load images in manageable batches (e.g., 10 at a time)
+  async loadRemainingImagesBatched() {
+    const batchSize = 10; 
+    
+    for (let i = 1; i < this.totalImages; i += batchSize) {
+      const batch = [];
+      for (let j = 0; j < batchSize && (i + j) < this.totalImages; j++) {
+        batch.push(this.loadSingleImage(i + j));
+      }
+      // Wait for these 10 to finish before requesting the next 10
+      await Promise.all(batch); 
+      
+      // Tell the render loop to check if it missed a frame while waiting
+      if (this.isInView) this.scheduleRender(); 
     }
   }
 
@@ -69,6 +80,8 @@ class ScrubVideo {
         resolve();
       };
       img.onerror = resolve; // Continue sequence even if one frame 404s
+      
+      // Note: Swap .png to .webp here and in your folder for massive speed gains
       img.src = `${this.folder}${index + 1}.png`;
     });
   }
@@ -138,10 +151,27 @@ class ScrubVideo {
       this.lastOpacity = this.targetOpacity;
     }
 
-    const img = this.images[this.currentFrameIndex];
-    if (!img || this.currentFrameIndex === this.lastFrameIndex) return;
+    let img = this.images[this.currentFrameIndex];
+    let actualFrameDrawn = this.currentFrameIndex;
+
+    // Fallback to the closest loaded frame if the user scrubs too fast
+    if (!img) {
+      for (let i = this.currentFrameIndex - 1; i >= 0; i--) {
+        if (this.images[i]) {
+          img = this.images[i];
+          actualFrameDrawn = i;
+          break;
+        }
+      }
+    }
+
+    // If still no image, or we already drew this exact frame state, do nothing
+    if (!img || (this.currentFrameIndex === this.lastFrameIndex && this.lastDrawnFrame === actualFrameDrawn)) {
+      return;
+    }
 
     this.lastFrameIndex = this.currentFrameIndex;
+    this.lastDrawnFrame = actualFrameDrawn; 
 
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.drawImage(img, 0, 0, this.canvas.width, this.canvas.height);

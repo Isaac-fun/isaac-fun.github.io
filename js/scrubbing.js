@@ -1,12 +1,18 @@
 class ScrubVideo {
   constructor(section) {
-    this.section      = section;
-    this.canvas       = section.querySelector('canvas');
-    this.ctx          = this.canvas.getContext('2d', { alpha: true, desynchronized: true });
-    this.figcaption   = section.querySelector('figcaption');
-    this.folder       = section.dataset.folder;
-    this.totalImages  = parseInt(section.dataset.frames, 10);
-    this.frames       = new Array(this.totalImages); // Stores ImageBitmap objects
+    this.section     = section;
+    this.canvas      = section.querySelector('canvas');
+    this.ctx         = this.canvas.getContext('2d', { alpha: true, desynchronized: true });
+    this.figcaption  = section.querySelector('figcaption');
+    this.folder      = section.dataset.folder;
+    this.totalImages = parseInt(section.dataset.frames, 10);
+
+    // LRU frame cache — stores { bitmap/img, lastUsed } keyed by index
+    this.frameCache  = new Map();
+
+    // Mobile gets a smaller budget to stay well under OS memory limits.
+    // Desktop gets more for smoother scrubbing.
+    this.FRAME_BUDGET = this.isMobile() ? 20 : 50;
 
     // Scroll state
     this.currentFrameIndex = 0;
@@ -27,16 +33,21 @@ class ScrubVideo {
     this.lastOpacity   = '';
 
     // Concurrency-limited loader
-    this.MAX_CONCURRENT = 4;
+    // Mobile: fewer parallel requests to avoid saturating a slow radio
+    this.MAX_CONCURRENT = this.isMobile() ? 2 : 4;
     this.activeLoads    = new Set();
     this.loadQueue      = [];
 
     this.init();
   }
 
+  isMobile() {
+    return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)
+      || window.innerWidth < 768;
+  }
+
   init() {
     this.canvas.style.willChange = 'contents';
-
     this.resize();
 
     this.observer = new IntersectionObserver((entries) => {
@@ -46,11 +57,14 @@ class ScrubVideo {
         this.onScroll();
         this.reprioritizeQueue();
         this.drainQueue();
+      } else {
+        // When off-screen, cancel pending loads and free distant frames
+        this.loadQueue = [];
+        this.evictDistantFrames(0); // Keep only a tiny window around current pos
       }
     }, { rootMargin: '100% 0px' });
     this.observer.observe(this.section);
 
-    // Load frame 0 first so something is visible immediately
     this.loadFrame(0).then(() => {
       this.scheduleRender();
       this.buildAndStartQueue();
@@ -60,11 +74,72 @@ class ScrubVideo {
     window.addEventListener('resize', () => this.debouncedResize(), { passive: true });
   }
 
+  // ─── LRU Cache ────────────────────────────────────────────────────────────────
+
+  /** Get a frame from cache, updating its last-used timestamp. */
+  getFrame(index) {
+    const entry = this.frameCache.get(index);
+    if (!entry) return null;
+    entry.lastUsed = performance.now();
+    return entry.data;
+  }
+
+  /** Store a frame in cache, then evict if over budget. */
+  storeFrame(index, data) {
+    this.frameCache.set(index, { data, lastUsed: performance.now() });
+    this.evictIfOverBudget();
+  }
+
+  hasFrame(index) {
+    return this.frameCache.has(index);
+  }
+
+  /**
+   * If the cache is over budget, evict the frame that is:
+   *   1. Furthest from the current scroll position (distance-first)
+   *   2. Least recently used as a tiebreaker
+   * This keeps the frames the user is most likely to need next.
+   */
+  evictIfOverBudget() {
+    if (this.frameCache.size <= this.FRAME_BUDGET) return;
+
+    const pivot = this.currentFrameIndex;
+    // Sort entries: furthest distance first, then oldest lastUsed
+    const sorted = [...this.frameCache.entries()].sort(([ai, a], [bi, b]) => {
+      const distDiff = Math.abs(bi - pivot) - Math.abs(ai - pivot);
+      return distDiff !== 0 ? distDiff : a.lastUsed - b.lastUsed;
+    });
+
+    const toEvict = sorted.slice(0, this.frameCache.size - this.FRAME_BUDGET);
+    for (const [index, entry] of toEvict) {
+      entry.data?.close?.(); // Free the GPU/memory bitmap
+      this.frameCache.delete(index);
+      // Put it back on the load queue in case the user scrolls back
+      if (!this.loadQueue.includes(index)) {
+        this.loadQueue.push(index);
+      }
+    }
+  }
+
+  /**
+   * When the section goes off-screen, aggressively free frames
+   * outside a small window around the current position.
+   */
+  evictDistantFrames(keepRadius = 5) {
+    const pivot = this.currentFrameIndex;
+    for (const [index, entry] of this.frameCache.entries()) {
+      if (Math.abs(index - pivot) > keepRadius) {
+        entry.data?.close?.();
+        this.frameCache.delete(index);
+      }
+    }
+  }
+
   // ─── Loading ─────────────────────────────────────────────────────────────────
 
   buildAndStartQueue() {
     const order = this.buildPriorityOrder(0);
-    this.loadQueue = order.filter(i => i !== 0 && !this.frames[i]);
+    this.loadQueue = order.filter(i => i !== 0 && !this.hasFrame(i));
     this.drainQueue();
   }
 
@@ -84,14 +159,14 @@ class ScrubVideo {
   reprioritizeQueue() {
     const pivot = this.currentFrameIndex;
     this.loadQueue = this.loadQueue
-      .filter(i => !this.frames[i] && !this.activeLoads.has(i))
+      .filter(i => !this.hasFrame(i) && !this.activeLoads.has(i))
       .sort((a, b) => Math.abs(a - pivot) - Math.abs(b - pivot));
   }
 
   drainQueue() {
     while (this.activeLoads.size < this.MAX_CONCURRENT && this.loadQueue.length > 0) {
       const index = this.loadQueue.shift();
-      if (this.frames[index] || this.activeLoads.has(index)) continue;
+      if (this.hasFrame(index) || this.activeLoads.has(index)) continue;
       this.activeLoads.add(index);
       this.loadFrame(index).then(() => {
         this.activeLoads.delete(index);
@@ -101,14 +176,9 @@ class ScrubVideo {
     }
   }
 
-  /**
-   * Uses new Image() to avoid any CORS issues, then converts to ImageBitmap
-   * for fast GPU-ready drawing. Falls back to storing the raw img element
-   * if createImageBitmap isn't supported.
-   */
   loadFrame(index) {
     return new Promise((resolve) => {
-      if (this.frames[index]) return resolve();
+      if (this.hasFrame(index)) return resolve();
 
       const img    = new Image();
       img.decoding = 'async';
@@ -117,23 +187,21 @@ class ScrubVideo {
         if (typeof createImageBitmap === 'function') {
           createImageBitmap(img)
             .then(bitmap => {
-              this.frames[index] = bitmap;
+              this.storeFrame(index, bitmap);
               resolve();
             })
             .catch(() => {
-              // createImageBitmap failed — fall back to the img element directly
-              this.frames[index] = img;
+              this.storeFrame(index, img);
               resolve();
             });
         } else {
-          // Browser doesn't support createImageBitmap (rare) — use img directly
-          this.frames[index] = img;
+          this.storeFrame(index, img);
           resolve();
         }
       };
 
-      img.onerror = resolve; // Don't let one bad frame stall the queue
-      img.src     = `${this.folder}${index + 1}.png`; // ← swap to .webp for huge speed gains
+      img.onerror = resolve;
+      img.src = `${this.folder}${index + 1}.png`; // ← swap .png → .webp for huge gains
     });
   }
 
@@ -209,18 +277,20 @@ class ScrubVideo {
       this.lastOpacity              = this.targetOpacity;
     }
 
-    // Try exact frame, then search backward, then forward
-    let frame       = this.frames[this.currentFrameIndex];
+    // getFrame() updates lastUsed timestamp — important for LRU eviction
+    let frame       = this.getFrame(this.currentFrameIndex);
     let actualDrawn = this.currentFrameIndex;
 
     if (!frame) {
       for (let i = this.currentFrameIndex - 1; i >= 0; i--) {
-        if (this.frames[i]) { frame = this.frames[i]; actualDrawn = i; break; }
+        const f = this.getFrame(i);
+        if (f) { frame = f; actualDrawn = i; break; }
       }
     }
     if (!frame) {
       for (let i = this.currentFrameIndex + 1; i < this.totalImages; i++) {
-        if (this.frames[i]) { frame = this.frames[i]; actualDrawn = i; break; }
+        const f = this.getFrame(i);
+        if (f) { frame = f; actualDrawn = i; break; }
       }
     }
 
@@ -240,8 +310,12 @@ class ScrubVideo {
   destroy() {
     if (this.observer) this.observer.disconnect();
     clearTimeout(this._resizeTimer);
-    // Free GPU bitmap memory for anything that was converted
-    this.frames.forEach(f => f?.close?.());
+    this.loadQueue = [];
+    // Free all GPU bitmap memory
+    for (const entry of this.frameCache.values()) {
+      entry.data?.close?.();
+    }
+    this.frameCache.clear();
   }
 }
 

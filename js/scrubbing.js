@@ -11,17 +11,17 @@ class ScrubVideo {
               || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
     this.USE_BITMAP     = !this.isIOS && typeof createImageBitmap === 'function';
-    this.FRAME_BUDGET   = this.isIOS ? 12 : 50;
-    this.PRELOAD_RADIUS = this.isIOS ? 8  : 30;
-    this.MAX_CONCURRENT = this.isIOS ? 1  : 4;
+    this.MAX_CONCURRENT = this.isIOS ? 2 : 4;
 
-    this.frameCache = new Map();
+    // Simple flat array — no Map, no eviction while in view
+    this.frames = new Array(this.totalImages).fill(null);
 
     this.currentFrameIndex = 0;
     this.lastFrameIndex    = -1;
     this.lastDrawnFrame    = -1;
     this.pendingRender     = false;
     this.isInView          = false;
+    this.loadingStarted    = false; // Guard so we only kick off loading once
 
     this.rectTop    = 0;
     this.rectHeight = 0;
@@ -44,131 +44,65 @@ class ScrubVideo {
 
     this.observer = new IntersectionObserver((entries) => {
       this.isInView = entries[0].isIntersecting;
+
       if (this.isInView) {
         this.updateScrollMath();
-        this.onScroll();
-        // ← THE FIX: always rebuild the queue when coming back into view.
-        // onScroll() only calls buildWindowQueue if frameDelta > 3,
-        // but if the user hasn't scrolled the index is the same and
-        // frameDelta === 0, so nothing ever reloads.
-        this.buildWindowQueue(this.currentFrameIndex);
+        this.syncScroll();
+
+        // Kick off loading the first time we enter view
+        if (!this.loadingStarted) {
+          this.loadingStarted = true;
+          this.startLoading();
+        } else {
+          // Re-entering view: restart any stalled queue
+          this.drainQueue();
+        }
       } else {
-        // Off-screen: stop loading, free distant frames
+        // Fully off screen: cancel pending loads
+        // Do NOT clear the frames array — we want frames to persist
+        // so scrolling back is instant
         this.loadQueue = [];
-        this.activeLoads.clear();
-        this.evictOutsideRadius(3);
       }
-    }, { rootMargin: '50% 0px' });
+    }, { rootMargin: '20% 0px' });
+
     this.observer.observe(this.section);
 
-    this.loadFrame(0).then(() => {
-      this.scheduleRender();
-    });
-
-    window.addEventListener('scroll', () => { if (this.isInView) this.onScroll(); }, { passive: true });
-    window.addEventListener('resize', () => this.debouncedResize(), { passive: true });
-  }
-
-  // ─── LRU Cache ───────────────────────────────────────────────────────────────
-
-  getFrame(index) {
-    const entry = this.frameCache.get(index);
-    if (!entry) return null;
-    entry.lastUsed = performance.now();
-    return entry.data;
-  }
-
-  hasFrame(index) {
-    return this.frameCache.has(index);
-  }
-
-  storeFrame(index, data) {
-    this.frameCache.set(index, { data, lastUsed: performance.now() });
-    this.evictIfOverBudget();
-  }
-
-  evictIfOverBudget() {
-    if (this.frameCache.size <= this.FRAME_BUDGET) return;
-    const pivot = this.currentFrameIndex;
-    const sorted = [...this.frameCache.entries()].sort(([ai, a], [bi, b]) => {
-      const distDiff = Math.abs(bi - pivot) - Math.abs(ai - pivot);
-      return distDiff !== 0 ? distDiff : a.lastUsed - b.lastUsed;
-    });
-    const evictCount = this.frameCache.size - this.FRAME_BUDGET;
-    for (let i = 0; i < evictCount; i++) {
-      const [index, entry] = sorted[i];
-      this.freeEntry(entry);
-      this.frameCache.delete(index);
-    }
-  }
-
-  evictOutsideRadius(radius) {
-    const pivot = this.currentFrameIndex;
-    for (const [index, entry] of this.frameCache.entries()) {
-      if (Math.abs(index - pivot) > radius) {
-        this.freeEntry(entry);
-        this.frameCache.delete(index);
-      }
-    }
-  }
-
-  freeEntry(entry) {
-    if (!entry?.data) return;
-    if (typeof entry.data.close === 'function') {
-      entry.data.close();
-    } else if (entry.data instanceof HTMLImageElement) {
-      entry.data.onload  = null;
-      entry.data.onerror = null;
-      entry.data.src     = '';
-    }
+    // Use pageYOffset for iOS Safari compat
+    window.addEventListener('scroll',     () => { if (this.isInView) this.syncScroll(); }, { passive: true });
+    window.addEventListener('touchmove',  () => { if (this.isInView) this.syncScroll(); }, { passive: true });
+    window.addEventListener('resize',     () => this.debouncedResize(), { passive: true });
   }
 
   // ─── Loading ─────────────────────────────────────────────────────────────────
 
-  buildWindowQueue(pivot) {
-    const lo = Math.max(0, pivot - this.PRELOAD_RADIUS);
-    const hi = Math.min(this.totalImages - 1, pivot + this.PRELOAD_RADIUS);
+  startLoading() {
+    // Load frame 0 immediately so something is visible
+    this.loadFrame(0).then(() => {
+      this.scheduleRender();
 
-    const order = [pivot];
-    let l = pivot - 1, h = pivot + 1;
-    while (l >= lo || h <= hi) {
-      if (h <= hi) order.push(h++);
-      if (l >= lo) order.push(l--);
-    }
-
-    // Merge with existing queue rather than replacing it —
-    // avoids re-queuing frames already in-flight
-    const inQueue = new Set(this.loadQueue);
-    for (const i of order) {
-      if (!this.hasFrame(i) && !this.activeLoads.has(i) && !inQueue.has(i)) {
-        this.loadQueue.push(i);
-        inQueue.add(i);
-      }
-    }
-
-    // Re-sort so closest frames always drain first
-    this.loadQueue.sort((a, b) =>
-      Math.abs(a - pivot) - Math.abs(b - pivot)
-    );
-
-    this.drainQueue();
+      // Build full sequential queue starting from current position outward
+      const pivot = this.currentFrameIndex;
+      const order = this.buildPriorityOrder(pivot);
+      this.loadQueue = order.filter(i => !this.frames[i]);
+      this.drainQueue();
+    });
   }
 
-  reprioritizeQueue() {
-    const pivot = this.currentFrameIndex;
-    this.loadQueue = this.loadQueue
-      .filter(i => {
-        if (this.hasFrame(i) || this.activeLoads.has(i)) return false;
-        if (Math.abs(i - pivot) > this.PRELOAD_RADIUS) return false;
-        return true;
-      })
-      .sort((a, b) => Math.abs(a - pivot) - Math.abs(b - pivot));
+  buildPriorityOrder(pivot) {
+    const order = [];
+    let lo = pivot - 1, hi = pivot + 1;
+    order.push(pivot);
+    while (lo >= 0 || hi < this.totalImages) {
+      if (hi < this.totalImages) order.push(hi++);
+      if (lo >= 0)               order.push(lo--);
+    }
+    return order;
   }
 
   drainQueue() {
     while (this.activeLoads.size < this.MAX_CONCURRENT && this.loadQueue.length > 0) {
       const index = this.loadQueue.shift();
-      if (this.hasFrame(index) || this.activeLoads.has(index)) continue;
+      if (this.frames[index] || this.activeLoads.has(index)) continue;
       this.activeLoads.add(index);
       this.loadFrame(index).then(() => {
         this.activeLoads.delete(index);
@@ -178,9 +112,17 @@ class ScrubVideo {
     }
   }
 
+  // Bump a target index to the front of the queue
+  prioritize(index) {
+    this.loadQueue = [
+      index,
+      ...this.loadQueue.filter(i => i !== index)
+    ];
+  }
+
   loadFrame(index) {
     return new Promise((resolve) => {
-      if (this.hasFrame(index)) return resolve();
+      if (this.frames[index]) return resolve();
 
       const img    = new Image();
       img.decoding = 'async';
@@ -188,16 +130,16 @@ class ScrubVideo {
       img.onload = () => {
         if (this.USE_BITMAP) {
           createImageBitmap(img)
-            .then(bitmap => { this.storeFrame(index, bitmap); resolve(); })
-            .catch(()    => { this.storeFrame(index, img);    resolve(); });
+            .then(bitmap => { this.frames[index] = bitmap; resolve(); })
+            .catch(()    => { this.frames[index] = img;    resolve(); });
         } else {
-          this.storeFrame(index, img);
+          this.frames[index] = img;
           resolve();
         }
       };
 
-      img.onerror = resolve;
-      img.src = `${this.folder}${index + 1}.png`;
+      img.onerror = resolve; // Don't stall the queue on a bad frame
+      img.src = `${this.folder}${index + 1}.png`; // ← swap .png → .webp for big gains
     });
   }
 
@@ -219,43 +161,42 @@ class ScrubVideo {
 
   updateScrollMath() {
     const rect      = this.section.getBoundingClientRect();
-    this.rectTop    = rect.top + window.scrollY;
+    this.rectTop    = rect.top + (window.pageYOffset || window.scrollY);
     this.rectHeight = rect.height;
   }
 
-  // ─── Scroll Handler ───────────────────────────────────────────────────────────
+  // ─── Scroll ───────────────────────────────────────────────────────────────────
 
-  onScroll() {
-    const scrollY        = window.scrollY;
+  syncScroll() {
+    // pageYOffset is more reliable than scrollY on older iOS Safari
+    const scrollY        = window.pageYOffset || window.scrollY;
     const currentRectTop = this.rectTop - scrollY;
-    let scrollProgress   = (this.winHeight - currentRectTop) / (this.rectHeight + this.winHeight);
-    scrollProgress       = Math.max(0, Math.min(scrollProgress, 1));
+    let   progress       = (this.winHeight - currentRectTop) / (this.rectHeight + this.winHeight);
+    progress             = Math.max(0, Math.min(progress, 1));
 
-    const newFrameIndex = Math.min(
-      Math.floor(scrollProgress * this.totalImages),
+    const newIndex = Math.min(
+      Math.floor(progress * this.totalImages),
       this.totalImages - 1
     );
 
-    const frameDelta = Math.abs(newFrameIndex - this.currentFrameIndex);
-    this.currentFrameIndex = newFrameIndex;
-
-    if (frameDelta > 3) {
-      this.buildWindowQueue(this.currentFrameIndex);
-    } else if (frameDelta > 0) {
-      this.reprioritizeQueue();
+    // If the target frame isn't loaded yet, move it to the front of the queue
+    if (!this.frames[newIndex] && !this.activeLoads.has(newIndex)) {
+      this.prioritize(newIndex);
       this.drainQueue();
     }
 
-    const brightness   = Math.min(100, scrollProgress * 80);
+    this.currentFrameIndex = newIndex;
+
+    const brightness   = Math.min(100, progress * 80);
     this.targetFilter  = `brightness(${brightness.toFixed(1)}%)`;
-    this.targetOpacity = scrollProgress.toFixed(3);
+    this.targetOpacity = progress.toFixed(3);
 
     if (this.currentFrameIndex !== this.lastFrameIndex || this.targetFilter !== this.lastFilter) {
       this.scheduleRender();
     }
   }
 
-  // ─── Render Loop ─────────────────────────────────────────────────────────────
+  // ─── Render ───────────────────────────────────────────────────────────────────
 
   scheduleRender() {
     if (this.pendingRender) return;
@@ -275,25 +216,24 @@ class ScrubVideo {
       this.lastOpacity              = this.targetOpacity;
     }
 
-    let frame       = this.getFrame(this.currentFrameIndex);
+    // Find the best available frame: exact → nearest behind → nearest ahead
+    let frame       = this.frames[this.currentFrameIndex];
     let actualDrawn = this.currentFrameIndex;
 
     if (!frame) {
       for (let i = this.currentFrameIndex - 1; i >= 0; i--) {
-        const f = this.getFrame(i);
-        if (f) { frame = f; actualDrawn = i; break; }
+        if (this.frames[i]) { frame = this.frames[i]; actualDrawn = i; break; }
       }
     }
     if (!frame) {
       for (let i = this.currentFrameIndex + 1; i < this.totalImages; i++) {
-        const f = this.getFrame(i);
-        if (f) { frame = f; actualDrawn = i; break; }
+        if (this.frames[i]) { frame = this.frames[i]; actualDrawn = i; break; }
       }
     }
 
-    if (!frame || (this.currentFrameIndex === this.lastFrameIndex && this.lastDrawnFrame === actualDrawn)) {
-      return;
-    }
+    // Skip if nothing to draw or the canvas already shows this exact frame
+    if (!frame) return;
+    if (this.currentFrameIndex === this.lastFrameIndex && this.lastDrawnFrame === actualDrawn) return;
 
     this.lastFrameIndex = this.currentFrameIndex;
     this.lastDrawnFrame = actualDrawn;
@@ -308,8 +248,7 @@ class ScrubVideo {
     if (this.observer) this.observer.disconnect();
     clearTimeout(this._resizeTimer);
     this.loadQueue = [];
-    for (const entry of this.frameCache.values()) this.freeEntry(entry);
-    this.frameCache.clear();
+    this.frames.forEach(f => f?.close?.());
   }
 }
 

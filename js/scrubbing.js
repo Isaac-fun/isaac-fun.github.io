@@ -2,48 +2,40 @@ class ScrubVideo {
   constructor(section) {
     this.section     = section;
     this.canvas      = section.querySelector('canvas');
-    this.ctx         = this.canvas.getContext('2d', { alpha: true, desynchronized: true });
+    this.ctx         = this.canvas.getContext('2d', { alpha: true });
     this.figcaption  = section.querySelector('figcaption');
     this.folder      = section.dataset.folder;
     this.totalImages = parseInt(section.dataset.frames, 10);
 
-    // LRU frame cache — stores { bitmap/img, lastUsed } keyed by index
-    this.frameCache  = new Map();
+    this.isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+              || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
-    // Mobile gets a smaller budget to stay well under OS memory limits.
-    // Desktop gets more for smoother scrubbing.
-    this.FRAME_BUDGET = this.isMobile() ? 20 : 50;
+    this.USE_BITMAP     = !this.isIOS && typeof createImageBitmap === 'function';
+    this.FRAME_BUDGET   = this.isIOS ? 12 : 50;
+    this.PRELOAD_RADIUS = this.isIOS ? 8  : 30;
+    this.MAX_CONCURRENT = this.isIOS ? 1  : 4;
 
-    // Scroll state
+    this.frameCache = new Map();
+
     this.currentFrameIndex = 0;
     this.lastFrameIndex    = -1;
     this.lastDrawnFrame    = -1;
     this.pendingRender     = false;
     this.isInView          = false;
 
-    // Cached layout metrics
     this.rectTop    = 0;
     this.rectHeight = 0;
     this.winHeight  = 0;
 
-    // Batched DOM writes
     this.targetFilter  = '';
     this.targetOpacity = '';
     this.lastFilter    = '';
     this.lastOpacity   = '';
 
-    // Concurrency-limited loader
-    // Mobile: fewer parallel requests to avoid saturating a slow radio
-    this.MAX_CONCURRENT = this.isMobile() ? 2 : 4;
-    this.activeLoads    = new Set();
-    this.loadQueue      = [];
+    this.activeLoads = new Set();
+    this.loadQueue   = [];
 
     this.init();
-  }
-
-  isMobile() {
-    return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)
-      || window.innerWidth < 768;
   }
 
   init() {
@@ -55,28 +47,30 @@ class ScrubVideo {
       if (this.isInView) {
         this.updateScrollMath();
         this.onScroll();
-        this.reprioritizeQueue();
-        this.drainQueue();
+        // ← THE FIX: always rebuild the queue when coming back into view.
+        // onScroll() only calls buildWindowQueue if frameDelta > 3,
+        // but if the user hasn't scrolled the index is the same and
+        // frameDelta === 0, so nothing ever reloads.
+        this.buildWindowQueue(this.currentFrameIndex);
       } else {
-        // When off-screen, cancel pending loads and free distant frames
+        // Off-screen: stop loading, free distant frames
         this.loadQueue = [];
-        this.evictDistantFrames(0); // Keep only a tiny window around current pos
+        this.activeLoads.clear();
+        this.evictOutsideRadius(3);
       }
-    }, { rootMargin: '100% 0px' });
+    }, { rootMargin: '50% 0px' });
     this.observer.observe(this.section);
 
     this.loadFrame(0).then(() => {
       this.scheduleRender();
-      this.buildAndStartQueue();
     });
 
     window.addEventListener('scroll', () => { if (this.isInView) this.onScroll(); }, { passive: true });
     window.addEventListener('resize', () => this.debouncedResize(), { passive: true });
   }
 
-  // ─── LRU Cache ────────────────────────────────────────────────────────────────
+  // ─── LRU Cache ───────────────────────────────────────────────────────────────
 
-  /** Get a frame from cache, updating its last-used timestamp. */
   getFrame(index) {
     const entry = this.frameCache.get(index);
     if (!entry) return null;
@@ -84,82 +78,90 @@ class ScrubVideo {
     return entry.data;
   }
 
-  /** Store a frame in cache, then evict if over budget. */
+  hasFrame(index) {
+    return this.frameCache.has(index);
+  }
+
   storeFrame(index, data) {
     this.frameCache.set(index, { data, lastUsed: performance.now() });
     this.evictIfOverBudget();
   }
 
-  hasFrame(index) {
-    return this.frameCache.has(index);
-  }
-
-  /**
-   * If the cache is over budget, evict the frame that is:
-   *   1. Furthest from the current scroll position (distance-first)
-   *   2. Least recently used as a tiebreaker
-   * This keeps the frames the user is most likely to need next.
-   */
   evictIfOverBudget() {
     if (this.frameCache.size <= this.FRAME_BUDGET) return;
-
     const pivot = this.currentFrameIndex;
-    // Sort entries: furthest distance first, then oldest lastUsed
     const sorted = [...this.frameCache.entries()].sort(([ai, a], [bi, b]) => {
       const distDiff = Math.abs(bi - pivot) - Math.abs(ai - pivot);
       return distDiff !== 0 ? distDiff : a.lastUsed - b.lastUsed;
     });
-
-    const toEvict = sorted.slice(0, this.frameCache.size - this.FRAME_BUDGET);
-    for (const [index, entry] of toEvict) {
-      entry.data?.close?.(); // Free the GPU/memory bitmap
+    const evictCount = this.frameCache.size - this.FRAME_BUDGET;
+    for (let i = 0; i < evictCount; i++) {
+      const [index, entry] = sorted[i];
+      this.freeEntry(entry);
       this.frameCache.delete(index);
-      // Put it back on the load queue in case the user scrolls back
-      if (!this.loadQueue.includes(index)) {
-        this.loadQueue.push(index);
-      }
     }
   }
 
-  /**
-   * When the section goes off-screen, aggressively free frames
-   * outside a small window around the current position.
-   */
-  evictDistantFrames(keepRadius = 5) {
+  evictOutsideRadius(radius) {
     const pivot = this.currentFrameIndex;
     for (const [index, entry] of this.frameCache.entries()) {
-      if (Math.abs(index - pivot) > keepRadius) {
-        entry.data?.close?.();
+      if (Math.abs(index - pivot) > radius) {
+        this.freeEntry(entry);
         this.frameCache.delete(index);
       }
     }
   }
 
-  // ─── Loading ─────────────────────────────────────────────────────────────────
-
-  buildAndStartQueue() {
-    const order = this.buildPriorityOrder(0);
-    this.loadQueue = order.filter(i => i !== 0 && !this.hasFrame(i));
-    this.drainQueue();
+  freeEntry(entry) {
+    if (!entry?.data) return;
+    if (typeof entry.data.close === 'function') {
+      entry.data.close();
+    } else if (entry.data instanceof HTMLImageElement) {
+      entry.data.onload  = null;
+      entry.data.onerror = null;
+      entry.data.src     = '';
+    }
   }
 
-  buildPriorityOrder(pivot) {
-    const order = [];
-    const n = this.totalImages;
-    let lo = pivot - 1;
-    let hi = pivot + 1;
-    order.push(pivot);
-    while (lo >= 0 || hi < n) {
-      if (hi < n)  order.push(hi++);
-      if (lo >= 0) order.push(lo--);
+  // ─── Loading ─────────────────────────────────────────────────────────────────
+
+  buildWindowQueue(pivot) {
+    const lo = Math.max(0, pivot - this.PRELOAD_RADIUS);
+    const hi = Math.min(this.totalImages - 1, pivot + this.PRELOAD_RADIUS);
+
+    const order = [pivot];
+    let l = pivot - 1, h = pivot + 1;
+    while (l >= lo || h <= hi) {
+      if (h <= hi) order.push(h++);
+      if (l >= lo) order.push(l--);
     }
-    return order;
+
+    // Merge with existing queue rather than replacing it —
+    // avoids re-queuing frames already in-flight
+    const inQueue = new Set(this.loadQueue);
+    for (const i of order) {
+      if (!this.hasFrame(i) && !this.activeLoads.has(i) && !inQueue.has(i)) {
+        this.loadQueue.push(i);
+        inQueue.add(i);
+      }
+    }
+
+    // Re-sort so closest frames always drain first
+    this.loadQueue.sort((a, b) =>
+      Math.abs(a - pivot) - Math.abs(b - pivot)
+    );
+
+    this.drainQueue();
   }
 
   reprioritizeQueue() {
     const pivot = this.currentFrameIndex;
     this.loadQueue = this.loadQueue
-      .filter(i => !this.hasFrame(i) && !this.activeLoads.has(i))
+      .filter(i => {
+        if (this.hasFrame(i) || this.activeLoads.has(i)) return false;
+        if (Math.abs(i - pivot) > this.PRELOAD_RADIUS) return false;
+        return true;
+      })
       .sort((a, b) => Math.abs(a - pivot) - Math.abs(b - pivot));
   }
 
@@ -184,16 +186,10 @@ class ScrubVideo {
       img.decoding = 'async';
 
       img.onload = () => {
-        if (typeof createImageBitmap === 'function') {
+        if (this.USE_BITMAP) {
           createImageBitmap(img)
-            .then(bitmap => {
-              this.storeFrame(index, bitmap);
-              resolve();
-            })
-            .catch(() => {
-              this.storeFrame(index, img);
-              resolve();
-            });
+            .then(bitmap => { this.storeFrame(index, bitmap); resolve(); })
+            .catch(()    => { this.storeFrame(index, img);    resolve(); });
         } else {
           this.storeFrame(index, img);
           resolve();
@@ -201,7 +197,7 @@ class ScrubVideo {
       };
 
       img.onerror = resolve;
-      img.src = `${this.folder}${index + 1}.png`; // ← swap .png → .webp for huge gains
+      img.src = `${this.folder}${index + 1}.png`;
     });
   }
 
@@ -209,7 +205,7 @@ class ScrubVideo {
 
   debouncedResize() {
     clearTimeout(this._resizeTimer);
-    this._resizeTimer = setTimeout(() => this.resize(), 100);
+    this._resizeTimer = setTimeout(() => this.resize(), 150);
   }
 
   resize() {
@@ -240,12 +236,14 @@ class ScrubVideo {
       this.totalImages - 1
     );
 
-    if (Math.abs(newFrameIndex - this.currentFrameIndex) > 5) {
-      this.currentFrameIndex = newFrameIndex;
+    const frameDelta = Math.abs(newFrameIndex - this.currentFrameIndex);
+    this.currentFrameIndex = newFrameIndex;
+
+    if (frameDelta > 3) {
+      this.buildWindowQueue(this.currentFrameIndex);
+    } else if (frameDelta > 0) {
       this.reprioritizeQueue();
       this.drainQueue();
-    } else {
-      this.currentFrameIndex = newFrameIndex;
     }
 
     const brightness   = Math.min(100, scrollProgress * 80);
@@ -277,7 +275,6 @@ class ScrubVideo {
       this.lastOpacity              = this.targetOpacity;
     }
 
-    // getFrame() updates lastUsed timestamp — important for LRU eviction
     let frame       = this.getFrame(this.currentFrameIndex);
     let actualDrawn = this.currentFrameIndex;
 
@@ -311,10 +308,7 @@ class ScrubVideo {
     if (this.observer) this.observer.disconnect();
     clearTimeout(this._resizeTimer);
     this.loadQueue = [];
-    // Free all GPU bitmap memory
-    for (const entry of this.frameCache.values()) {
-      entry.data?.close?.();
-    }
+    for (const entry of this.frameCache.values()) this.freeEntry(entry);
     this.frameCache.clear();
   }
 }

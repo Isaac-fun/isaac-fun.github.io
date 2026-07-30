@@ -139,7 +139,10 @@ class ScrubVideo {
       };
 
       img.onerror = resolve; // Don't stall the queue on a bad frame
-      img.src = `${this.folder}${index + 1}.png`; // ← swap .png → .webp for big gains
+
+      const frameTemplate = this.section.dataset.frameTemplate || `${index + 1}.png`;
+      const frameName = frameTemplate.replace('{n}', index + 1);
+      img.src = `${this.folder}${frameName}`;
     });
   }
 

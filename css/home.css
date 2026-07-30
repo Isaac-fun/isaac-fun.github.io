@@ -66,7 +66,7 @@ ul li {
   text-decoration: none;
   border-radius: 80px;
   font-family: 'BBH Sans Bogle', sans-serif;
-  font-size: clamp(1.4rem, 4.2vw, 4.4rem);
+  font-size: clamp(1rem, 2.8vw, 2.4rem);
   width: 100%;
   max-width: 100%;
   text-align: center;
@@ -167,7 +167,7 @@ li:nth-child(2) a:hover {
   text-decoration: none;
   border-radius: 80px;
   font-family: 'BBH Sans Bogle', sans-serif;
-  font-size: clamp(1.1rem, 5.8vw, 2.8rem);
+  font-size: clamp(0.9rem, 4.2vw, 1.8rem);
   width: 100%;
   max-width: 100%;
   text-align: center;

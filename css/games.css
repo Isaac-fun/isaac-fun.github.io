@@ -1,0 +1,70 @@
+html, body {
+  height: 100%;
+  margin: 0;
+  min-height: 100%;
+  background-attachment: fixed;
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
+  background: linear-gradient(90deg, rgba(214, 214, 214, 1) 0%, rgba(42, 123, 155, 1) 51%, rgba(0, 0, 0, 1) 100%);
+  color: #fff;
+  font-family: 'BBH Sans Bogle', sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6rem 1.5rem 3rem;
+  box-sizing: border-box;
+}
+
+.page-content {
+  width: min(900px, 100%);
+  background: rgba(0, 0, 0, 0.15);
+  backdrop-filter: blur(2px);
+  border-top: 1px solid rgba(255, 255, 255, 0.8);
+  border-right: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 2rem;
+  box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.2), inset 0 4px 20px rgba(255, 255, 255, 0.3);
+  color: #fff;
+  text-align: center;
+  padding: 2.25rem 2rem;
+}
+
+.page-content h1 {
+  margin: 0 0 0.75rem;
+  font-size: clamp(1.5rem, 3.5vw, 2.5rem);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.page-content p {
+  margin: 0;
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  line-height: 1.7;
+}
+
+header {
+  position: relative;
+  z-index: 10;
+}
+
+
+
+@media screen and (max-width: 600px) {
+  main {
+    padding: 5rem 1rem 2rem;
+  }
+
+  .page-content {
+    padding: 1.5rem 1rem;
+    border-radius: 1.25rem;
+  }
+}

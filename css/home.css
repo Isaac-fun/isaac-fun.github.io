@@ -5,6 +5,38 @@ nav {
     text-align: center;
 }
 
+body {
+  position: relative;
+  overflow-x: hidden;
+}
+
+body > :not(.parallax-layer):not(.nav):not(.parallax-icon) {
+  position: relative;
+  z-index: 1;
+}
+
+.parallax-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: url('../images/treeback.webp') center / cover no-repeat;
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+  pointer-events: none;
+  opacity: 0.95;
+}
+
+.parallax-icon {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: url('../images/homebackicon.webp') center / cover no-repeat;
+  opacity: 0.9;
+  pointer-events: none;
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+}
+
 ul {
   list-style: none;
   padding: 0;
@@ -41,9 +73,7 @@ ul li {
     display: none;
   }
  body {
-  background: 
-  url('../images/download+(1).gif' ) center /cover no-repeat ,
-  url('../images/isaac-fun home background.jpg' ) center /cover no-repeat ;
+  background: url('../images/homeback.webp' ) center /cover no-repeat;
   min-height: 100vh;
   display: grid;
   grid-template-rows: auto 1fr;
@@ -132,6 +162,10 @@ li:nth-child(2) a:hover {
 }
 
 @media only screen and (max-width: 600px) {
+  .parallax-layer{
+    display: none;
+  }
+
   .mobile {
     text-align: center;
     color: white;
@@ -145,7 +179,7 @@ li:nth-child(2) a:hover {
     font-family: 'BBH Sans Bogle', sans-serif;
   }
  body {
-  background: url('../images/home3.png' ) center /cover no-repeat ;
+  background: url('../images/homebackmobile.webp' ) center /cover no-repeat ;
   min-height: 100vh;
   display: grid;
   grid-template-rows: auto 1fr;
